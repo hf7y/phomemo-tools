@@ -1,147 +1,35 @@
-#! /usr/bin/python3
+#!/home/zach/.local/share/catprinter/venv/bin/python3
+import sys, os, asyncio
+from bleak import BleakClient
 
-import sys
-import os
-import subprocess
-import dbus
-import socket
-from urllib.parse import quote
+TX_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
 
-bus = dbus.SystemBus()
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
 
-device_id = 'CLS:PRINTER;CMD:EPSON;DES:Thermal Printer;MFG:Phomemo;MDL:'
-def scan_bluetooth():
-    try:
-        bluez = bus.get_object('org.bluez', '/')
-    except dbus.exceptions.DBusException:
-        print("WARNING: no bluetooth interface", file=sys.stderr)
-        return
-
-    manager = dbus.Interface(bluez, 'org.freedesktop.DBus.ObjectManager')
-
-    objects = manager.GetManagedObjects()
-
-    for path, interfaces in objects.items():
-        if 'org.bluez.Device1' not in interfaces.keys():
-            continue
-
-        properties = interfaces['org.bluez.Device1']
-
-        try:
-            name = properties['Name']
-        except KeyError:
-            continue
-
-        if (name.startswith('Mr.in')):
-            model = name[6:]
-        elif (name == 'T02'):
-            model = name
-        else:
-            continue
-
-        address = properties['Address']
-        device_uri = 'phomemo://' + address[0:2:]+address[3:5:]+address[6:8:]+address[9:11:]+address[12:14:]+address[15:17:]
-        device_make_and_model = 'Phomemo ' + model
-
-        print('direct ' + device_uri + ' "' + device_make_and_model + '" "' +
-              device_make_and_model + ' bluetooth ' + address + '" "' + device_id + model + ' (BT);"')
-
-class find_class(object):
-    def __init__(self, class_):
-        self._class = class_
-    def __call__(self, device):
-        # first, let's check the device
-        if device.bDeviceClass == self._class:
-            return True
-        # ok, transverse all devices to find an
-        # interface that matches our class
-        for cfg in device:
-            # find_descriptor: what's it?
-            intf = usb.util.find_descriptor(
-                                        cfg,
-                                        bInterfaceClass=self._class
-                                )
-            if intf is not None:
-                return True
-
-        return False
-
-def scan_usb():
-    printers = usb.core.find(find_all=1, custom_match=find_class(7), idVendor=0x0493)
-    for printer in printers:
-            for cfg in printer:
-                intf = usb.util.find_descriptor(cfg, bInterfaceClass=7)
-                if intf is None:
-                    continue
-                Interface = intf.bInterfaceNumber
-                break
-            if printer.idProduct == 0xb002:
-                model = 'M02'
-            elif printer.idProduct == 0x8760:
-                model = 'M110'
-            else:
-                model = 'Unknown(0x%04x)' % (printer.idProduct)
-            usb.util.get_langids(printer)
-            SerialNumber = usb.util.get_string(printer, printer.iSerialNumber)
-            device_uri = 'usb://%s/%s?serial=%s&interface=%d' % (quote(printer.manufacturer), quote(printer.product), SerialNumber, Interface)
-            device_make_and_model = 'Phomemo ' + model
-            print('direct ' + device_uri + ' "' + device_make_and_model + '" "' +
-              device_make_and_model + ' USB ' + SerialNumber + '" "' + device_id + model + ' (USB);"')
-
+async def send(bdaddr, data):
+    async with BleakClient(bdaddr) as client:
+        log("STATE: +sending-data")
+        chunk_size = client.mtu_size - 3
+        for i in range(0, len(data), chunk_size):
+            await client.write_gatt_char(TX_UUID, data[i:i + chunk_size], response=False)
+            await asyncio.sleep(0.02)
 
 if len(sys.argv) == 1:
-    scan_bluetooth()
-    try:
-        import usb.core
-        import usb.util
-    except ModuleNotFoundError:
-        print("WARNING: Please install python3-usb to support usb-discovery", file=sys.stderr)
-        exit(0)
-    scan_usb()
-    exit(0)
+    sys.exit(0)  # discovery mode: not needed, queue is already configured
 
+device_uri = os.environ.get('DEVICE_URI')
+if not device_uri or not device_uri.startswith('phomemo://'):
+    sys.exit(1)
+
+a = device_uri.split('://')[1]
+bdaddr = ':'.join(a[i:i+2] for i in range(0, 12, 2)).upper()
+log(f"DEBUG: connecting to {bdaddr}")
+
+data = sys.stdin.buffer.read()
 try:
-    device_uri = os.environ['DEVICE_URI']
-except:
-    exit(1)
-
-uri = device_uri.split('://')
-
-if uri[0] != 'phomemo':
-    exit(1)
-
-a = uri[1]
-bdaddr = a[0:2:] + ':' + a[2:4:] + ':' + a[4:6:] + ':' + a[6:8:] + ':' + a[8:10:] + ':' + a[10:12:]
-
-print('DEBUG: ' + sys.argv[0] +' device ' + bdaddr)
-
-try:
-    print('STATE: +connecting-to-device')
-    sock = socket.socket(socket.AF_BLUETOOTH, proto=socket.BTPROTO_RFCOMM)
-    sock.connect((bdaddr, 1))
-    print('STATE: +sending-data')
-    with os.fdopen(sys.stdin.fileno(), 'rb', closefd=False) as stdin:
-        while True:
-            data = stdin.read(8192)
-            size = len(data)
-            if size == 0:
-                break
-            sock.sendall(data)
-            print('DEBUG: sent %d' % (size))
-except OSError as btErr:
-    print("ERROR: Can't open Bluetooth connection: " + str(btErr), file=sys.stderr)
-    exit(1)
-except socket.error as SockErr:
-    print("ERROR: Cannot write data: " + str(SockErr), file=sys.stderr)
-    exit(1)
-try:
-    # we need to wait the printer answer before closing the socket
-    # otherwise the print is stopped
-    print('STATE: +receiving-data')
-    sock.settimeout(8)
-    while True:
-        received = sock.recv(28)
-        print('DEBUG: ' + " 0x".join("%02x" % b for b in received))
-except:
-    pass
-exit(0)
+    asyncio.run(send(bdaddr, data))
+except Exception as e:
+    log(f"ERROR: Can't send data over BLE: {e}")
+    sys.exit(1)
+sys.exit(0)
