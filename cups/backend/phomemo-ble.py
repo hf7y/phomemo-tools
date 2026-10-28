@@ -17,10 +17,6 @@
 # only becomes acknowledged after the ATT response. An acknowledgement confirms
 # transport acceptance, not printing. No retry is attempted once data may have
 # reached the printer.
-#
-# Models in UNBONDED_MODELS, such as an M02 without RFCOMM reached through a
-# phomemo-ble:// queue, print over an unbonded LE link instead: no pairing, and
-# FF02 written without response in paced 20-byte chunks.
 
 import asyncio
 import ctypes
@@ -70,17 +66,6 @@ CALL_TIMEOUT = 30.0
 CLEANUP_TIMEOUT = 5.0
 DRAIN_TIMEOUT = 60.0
 
-# Models whose FF02 accepts unacknowledged writes from an unbonded link. Every
-# other model keeps the bonded, acknowledged link. The gap paces those writes,
-# since without an ATT response nothing else stops the printer buffer overrunning.
-# The chunk stays at the default ATT MTU payload whatever MTU is negotiated:
-# BlueZ accepts unacknowledged writes as fast as they are submitted, so a larger
-# chunk only raises the rate beyond what the M02 has been seen to print from.
-UNBONDED_MODELS = ('M02',)
-UNBONDED_NOTIFY_TIMEOUT = 5
-UNACKNOWLEDGED_CHUNK = 20
-UNACKNOWLEDGED_GAP = 0.02
-
 ADDRESS_RE = re.compile(r'^[0-9A-Fa-f]{12}$')
 ADAPTER_RE = re.compile(r'^hci[0-9]+$')
 
@@ -124,26 +109,6 @@ def state(add = None, remove = None):
         print('STATE: +' + add, file=sys.stderr, flush=True)
     if remove:
         print('STATE: -' + remove, file=sys.stderr, flush=True)
-
-
-def ppd_path():
-    ppd = os.environ.get('PPD')
-    if not ppd:
-        ppd = '/etc/cups/ppd/%s.ppd' % os.environ.get('PRINTER', '')
-    return ppd
-
-
-def model_from_ppd():
-    # Same ModelName match as the phomemo backend, which does not run for a
-    # phomemo-ble:// queue.
-    try:
-        with open(ppd_path(), 'rb') as fh:
-            for line in fh:
-                if line.startswith(b'*ModelName:'):
-                    return line[11:].decode('latin-1').strip().strip('"').split()[-1]
-    except Exception:
-        pass
-    return ''
 
 
 def parse_address(text):
@@ -619,7 +584,7 @@ async def ensure_trusted(call, discovered_props = None):
 
 
 async def explicit_le_connect(device, configured_adapter = None, cancel_event = None,
-                              allow_pairing = False, pairing_callback = None, bond = True):
+                              allow_pairing = False, pairing_callback = None):
     """Connect the exact BlueZ device without an ambiguous bearer fallback.
 
     An existing exact-address connection is adopted. Otherwise this prefers
@@ -627,9 +592,7 @@ async def explicit_le_connect(device, configured_adapter = None, cancel_event = 
     bond, a random address, or a verified PreferredBearer=le, and fails closed for
     an ambiguous public-address device. Pairing and connection each receive one
     bounded attempt; connections created during a failed attempt are rolled back
-    best-effort. Without bond, pairing is skipped and, when ConnectDevice is
-    unavailable, Device1.Connect is used: with no bond on either bearer, a printer
-    without BR/EDR is only reachable over LE.
+    best-effort.
     """
     path = device.details.get('path')
     props = device.details.get('props', {})
@@ -641,7 +604,7 @@ async def explicit_le_connect(device, configured_adapter = None, cancel_event = 
     address_type = props.get('AddressType')
     if address_type not in ('public', 'random'):
         raise RuntimeError('BlueZ discovery did not provide an LE address type')
-    if bond and not allow_pairing and props.get('Paired') is not True:
+    if not allow_pairing and props.get('Paired') is not True:
         raise PairingRequiredError(
             'Configured printer is not paired on the LE bearer; diagnostics do not initiate pairing')
 
@@ -658,7 +621,7 @@ async def explicit_le_connect(device, configured_adapter = None, cancel_event = 
             return True
 
         newly_paired = False
-        if bond and allow_pairing:
+        if allow_pairing:
             if address_type == 'public':
                 await ensure_preferred_le(call)
             newly_paired = await ensure_paired(bus, call, path, props,
@@ -687,8 +650,6 @@ async def explicit_le_connect(device, configured_adapter = None, cancel_event = 
                 owns_connection = True
             elif not any(marker in str(exc) for marker in ('UnknownMethod', 'NotSupported')):
                 raise
-            elif not bond:
-                await connect_device(call)
             else:
                 try:
                     await connect_with_provisioned_le(call)
@@ -775,16 +736,14 @@ class BleTransport:
     """Exact-address, explicit-LE transport for one ordered byte stream.
 
     Characteristics are resolved by UUID for each connection and writes are
-    serialized with ATT responses, or paced without them on an unbonded link;
-    no transport retry is performed. A byte is submitted before its write is
-    awaited because an error cannot prove non-delivery, and is acknowledged only
-    after that await succeeds. Both counters describe host-side transport, not
-    physical printing.
+    serialized with ATT responses; no transport retry is performed. A byte is
+    submitted before its write is awaited because an error cannot prove
+    non-delivery, and is acknowledged only after that await succeeds. Both
+    counters describe host-side transport, not physical printing.
     """
 
     def __init__(self, address, adapter, chunk_size, notification_callback,
-                 cancel_event = None, pairing_callback = None, allow_pairing = True,
-                 bond = True):
+                 cancel_event = None, pairing_callback = None, allow_pairing = True):
         self.address = address
         self.adapter = adapter
         self.chunk_size = chunk_size
@@ -792,7 +751,6 @@ class BleTransport:
         self.cancel_event = cancel_event or asyncio.Event()
         self.pairing_callback = pairing_callback or (lambda active: None)
         self.allow_pairing = allow_pairing
-        self.bond = bond
         self.client = None
         self.device_path = None
         self.owns_connection = False
@@ -825,7 +783,7 @@ class BleTransport:
         try:
             self.owns_connection = await explicit_le_connect(device, self.adapter,
                                                              self.cancel_event, self.allow_pairing,
-                                                             self.pairing_callback, self.bond)
+                                                             self.pairing_callback)
         except Exception as exc:
             if is_authentication_error(exc):
                 exc = SetupRequiredError(
@@ -846,33 +804,21 @@ class BleTransport:
 
         # ATT handles vary by device and connection, so captured numeric handles
         # are never production configuration. Acknowledged FF02 writes and FF03
-        # notifications are required before any job bytes are accepted on a bonded link.
+        # notifications are required before any job bytes are accepted.
         self.write_characteristic = self.client.services.get_characteristic(WRITE_UUID)
         self.notify_characteristic = self.client.services.get_characteristic(NOTIFY_UUID)
         if self.write_characteristic is None or self.notify_characteristic is None:
             raise RuntimeError('Required FF02/FF03 characteristics are missing')
-        if self.bond and 'write' not in self.write_characteristic.properties:
+        if 'write' not in self.write_characteristic.properties:
             raise RuntimeError('FF02 does not support acknowledged writes')
-        if not self.bond:
-            if 'write-without-response' not in self.write_characteristic.properties:
-                raise RuntimeError('FF02 does not support unacknowledged writes')
-            self.chunk_size = min(self.chunk_size, UNACKNOWLEDGED_CHUNK)
-            debug('unbonded link: chunk %d bytes' % self.chunk_size)
         if 'notify' not in self.notify_characteristic.properties:
             raise RuntimeError('FF03 does not support notifications')
 
         try:
-            # An unbonded M02 never completes the FF03 subscription; it prints
-            # without the back channel, so there the subscription is best effort.
             await wait_or_cancel(self.client.start_notify(self.notify_characteristic, self.notify),
-                                 self.cancel_event,
-                                 CONNECT_TIMEOUT if self.bond else UNBONDED_NOTIFY_TIMEOUT,
-                                 'notification setup')
+                                 self.cancel_event, CONNECT_TIMEOUT, 'notification setup')
             self.notifications_started = True
         except Exception as exc:
-            if not self.bond and not self.cancel_event.is_set():
-                debug('unbonded link: printing without FF03 notifications (%s)' % exc)
-                return
             if is_authentication_error(exc):
                 exc = SetupRequiredError(
                     'LE authentication failed; automatic pairing or bond recovery is required')
@@ -892,12 +838,9 @@ class BleTransport:
             # that the printer physically processed the bytes.
             self.submitted_bytes += len(chunk)
             await wait_or_cancel(self.client.write_gatt_char(
-                self.write_characteristic, chunk, response = self.bond),
+                self.write_characteristic, chunk, response = True),
                 self.cancel_event, WRITE_TIMEOUT, 'write')
-            # Unbonded, this counts bytes BlueZ accepted, not ATT responses.
             self.acknowledged_bytes += len(chunk)
-            if not self.bond:
-                await asyncio.sleep(UNACKNOWLEDGED_GAP)
 
     def notify(self, sender, data):
         self.notification_callback(bytes(data))
@@ -1270,7 +1213,6 @@ async def run_job(invocation, config, channels = None, transport_factory = BleTr
             pass
 
     channels = channels or CupsChannels()
-    bond = model_from_ppd() not in UNBONDED_MODELS
     transport = None
     source = None
     connecting = False
@@ -1300,7 +1242,7 @@ async def run_job(invocation, config, channels = None, transport_factory = BleTr
                 # construction order.
                 transport = transport_factory(address, adapter, chunk_size,
                                               lambda data: runtime.notification(data),
-                                              cancel_event, pairing_status, bond = bond)
+                                              cancel_event, pairing_status)
                 runtime = BackendRuntime(transport, channels, source, cancel_event)
                 connect_task = asyncio.create_task(transport.connect())
                 cancel_task = asyncio.create_task(cancel_event.wait())
