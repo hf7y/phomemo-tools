@@ -475,7 +475,8 @@ async def ensure_paired(bus, call, device_path, discovered_props, cancel_event, 
 
     Pairing is refused when existing bond state cannot be inspected. Completion is
     rechecked before returning, and timeout or cancellation requests CancelPairing.
-    Trust is deliberately applied later, only after verification.
+    The device is not marked trusted: BlueZ keeps auto-connecting a trusted
+    device that offers HID over GATT, as the M02 does, after every disconnect.
     """
     try:
         paired = await pairing_state(call, device_path, discovered_props)
@@ -587,24 +588,6 @@ async def connect_with_provisioned_le(call):
     await connect_device(call)
 
 
-async def ensure_trusted(call, discovered_props = None):
-    """Trust only the exact configured device after its LE bond is verified."""
-    discovered_props = discovered_props or {}
-    if discovered_props.get('Trusted') is True:
-        return False
-    try:
-        if await property_value(call, 'Trusted') is True:
-            return False
-        await call('org.freedesktop.DBus.Properties', 'Set', 'ssv',
-                   [DEVICE_INTERFACE, 'Trusted', Variant('b', True)])
-        value = await property_value(call, 'Trusted')
-    except RuntimeError as exc:
-        raise SetupRequiredError('Unable to trust the configured printer after pairing: %s' % exc) from exc
-    if value is not True:
-        raise SetupRequiredError('BlueZ did not retain Trusted=true for the configured printer')
-    return True
-
-
 async def explicit_le_connect(device, configured_adapter = None, cancel_event = None,
                               allow_pairing = False, pairing_callback = None):
     """Connect the exact BlueZ device without an ambiguous bearer fallback.
@@ -649,7 +632,6 @@ async def explicit_le_connect(device, configured_adapter = None, cancel_event = 
             newly_paired = await ensure_paired(bus, call, path, props,
                                                cancel_event or asyncio.Event(),
                                                CONNECT_TIMEOUT, pairing_callback)
-            await ensure_trusted(call, props)
         if newly_paired:
             if await device_connected(call, path):
                 # Device1.Pair connected over the LE discovery path and completed
