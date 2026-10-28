@@ -20,7 +20,7 @@
 #
 # Models in UNBONDED_MODELS, such as an M02 without RFCOMM reached through a
 # phomemo-ble:// queue, print over an unbonded LE link instead: no pairing, and
-# FF02 written without response in paced chunks that fit the ATT MTU.
+# FF02 written without response in paced 20-byte chunks.
 
 import asyncio
 import ctypes
@@ -73,8 +73,12 @@ DRAIN_TIMEOUT = 60.0
 # Models whose FF02 accepts unacknowledged writes from an unbonded link. Every
 # other model keeps the bonded, acknowledged link. The gap paces those writes,
 # since without an ATT response nothing else stops the printer buffer overrunning.
+# The chunk stays at the default ATT MTU payload whatever MTU is negotiated:
+# BlueZ accepts unacknowledged writes as fast as they are submitted, so a larger
+# chunk only raises the rate beyond what the M02 has been seen to print from.
 UNBONDED_MODELS = ('M02',)
 UNBONDED_NOTIFY_TIMEOUT = 5
+UNACKNOWLEDGED_CHUNK = 20
 UNACKNOWLEDGED_GAP = 0.02
 
 ADDRESS_RE = re.compile(r'^[0-9A-Fa-f]{12}$')
@@ -852,9 +856,7 @@ class BleTransport:
         if not self.bond:
             if 'write-without-response' not in self.write_characteristic.properties:
                 raise RuntimeError('FF02 does not support unacknowledged writes')
-            # BlueZ before 5.62 reports 20 here, which is always safe.
-            self.chunk_size = min(self.chunk_size,
-                                  self.write_characteristic.max_write_without_response_size)
+            self.chunk_size = min(self.chunk_size, UNACKNOWLEDGED_CHUNK)
             debug('unbonded link: chunk %d bytes' % self.chunk_size)
         if 'notify' not in self.notify_characteristic.properties:
             raise RuntimeError('FF03 does not support notifications')

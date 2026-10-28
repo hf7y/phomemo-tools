@@ -295,7 +295,7 @@ Use "Phomemo-M02.ppd.gz" for M02, "Phomemo-M02Pro.ppd.gz" for M02 Pro, and "Phom
 Some M02 units have no RFCOMM channel and are reached over Bluetooth Low Energy only.
 Define those with the `phomemo-ble://` scheme. The M02 needs no pairing and no BlueZ
 experimental mode: the backend connects without a bond and writes without response,
-in paced chunks that fit the negotiated MTU. It needs the `python3-bleak` and
+in paced 20-byte chunks. It needs the `python3-bleak` and
 `python3-dbus-fast` packages listed in section 2.1.
 
 ```
