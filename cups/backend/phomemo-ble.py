@@ -74,6 +74,7 @@ DRAIN_TIMEOUT = 60.0
 # other model keeps the bonded, acknowledged link. The gap paces those writes,
 # since without an ATT response nothing else stops the printer buffer overrunning.
 UNBONDED_MODELS = ('M02',)
+UNBONDED_NOTIFY_TIMEOUT = 5
 UNACKNOWLEDGED_GAP = 0.02
 
 ADDRESS_RE = re.compile(r'^[0-9A-Fa-f]{12}$')
@@ -841,7 +842,7 @@ class BleTransport:
 
         # ATT handles vary by device and connection, so captured numeric handles
         # are never production configuration. Acknowledged FF02 writes and FF03
-        # notifications are required before any job bytes are accepted.
+        # notifications are required before any job bytes are accepted on a bonded link.
         self.write_characteristic = self.client.services.get_characteristic(WRITE_UUID)
         self.notify_characteristic = self.client.services.get_characteristic(NOTIFY_UUID)
         if self.write_characteristic is None or self.notify_characteristic is None:
@@ -859,10 +860,17 @@ class BleTransport:
             raise RuntimeError('FF03 does not support notifications')
 
         try:
+            # An unbonded M02 never completes the FF03 subscription; it prints
+            # without the back channel, so there the subscription is best effort.
             await wait_or_cancel(self.client.start_notify(self.notify_characteristic, self.notify),
-                                 self.cancel_event, CONNECT_TIMEOUT, 'notification setup')
+                                 self.cancel_event,
+                                 CONNECT_TIMEOUT if self.bond else UNBONDED_NOTIFY_TIMEOUT,
+                                 'notification setup')
             self.notifications_started = True
         except Exception as exc:
+            if not self.bond and not self.cancel_event.is_set():
+                debug('unbonded link: printing without FF03 notifications (%s)' % exc)
+                return
             if is_authentication_error(exc):
                 exc = SetupRequiredError(
                     'LE authentication failed; automatic pairing or bond recovery is required')
